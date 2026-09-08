@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-MLB DFS Projection Pipeline (DraftKings 5-Man Stacks & Ownership Model)
+MLB DFS Projection Pipeline (GPP Team Stackability & Pitcher Dashboard)
 ────────────────────────────────────────────────────────────────────────
 Features:
-  - Algorithmic Ownership Projections: Normalized slate-wide ownership
-    for hitters (800% total slate pool) and pitchers (200% total slate pool).
-  - Ownership & GPP Leverage: Incorporates projected ownership into 
-    hitter, pitcher, and 5-man stack GPP leverage ratings.
-  - Dedicated Ownership Tab: Ranks top chalk vs. leverage plays across slates.
-  - Real Player Names: Official game lineups & active team rosters.
-  - Accurate Slate Classification: Python zoneinfo (America/New_York).
+  - Team Stackability Model: Replaces combo patterns with holistic team GPP scores 
+    combining Vegas totals, weather factors, team ceiling, and ownership leverage.
+  - Pitcher GPP Model: Scores pitchers using ceiling, projection, matchup risk, 
+    and projected ownership leverage.
+  - GPP Dashboard Tab: Highlights top 10 team stacks and top 7 GPP pitchers.
+  - Stacks Tab: Lists all team stackability scores slate-wide without stack types.
 """
 
 import os
@@ -65,7 +64,6 @@ ROSTER_CACHE = {}
 # ═════════════════════════════════════════════════════════════════════════════
 
 def get_slate_info(game_date_utc: str) -> str:
-    """Converts UTC game time to accurate Eastern Time and Slate category."""
     if not game_date_utc:
         return "Main Slate"
     try:
@@ -193,6 +191,7 @@ def fetch_mlb_slate_data():
                 away_lineup = fetch_team_active_hitters(away_team["id"])
 
             games.append({
+                "game_utc": game_utc,
                 "slate": slate_tag,
                 "home": home_team.get("name"),
                 "away": away_team.get("name"),
@@ -204,6 +203,7 @@ def fetch_mlb_slate_data():
                 "away_lineup": away_lineup,
                 "venue": game.get("venue", {}).get("name", "Default"),
             })
+        games.sort(key=lambda g: g.get("game_utc", ""))
         return games
     except Exception as e:
         log.error(f"Failed to load MLB schedule: {e}")
@@ -214,39 +214,33 @@ def fetch_mlb_slate_data():
 # ═════════════════════════════════════════════════════════════════════════════
 
 def normalize_slate_ownership(hitters: list, pitchers: list):
-    """
-    Normalizes ownership percentages per slate.
-    DK Hitter Total Pool = 800% per slate (8 hitter slots).
-    DK Pitcher Total Pool = 200% per slate (2 SP slots).
-    """
-    # Normalize Hitters by Slate
     slates = set(h["slate"] for h in hitters)
     for slate in slates:
         slate_hitters = [h for h in hitters if h["slate"] == slate]
         total_hitter_score = sum(h["raw_own_score"] for h in slate_hitters) or 1.0
         
         for h in slate_hitters:
-            # Scale to 800% pool, bounded between 0.5% and 35.0%
             proj_own = (h["raw_own_score"] / total_hitter_score) * 800.0
             h["proj_own"] = round(max(0.5, min(35.0, proj_own)), 1)
-            # Leverage Score incorporating Ownership: (Ceiling / Salary Ratio) / sqrt(Ownership)
             pts_per_k = h["ceiling"] / (h["salary"] / 1000)
             h["leverage"] = round(pts_per_k / ((h["proj_own"] ** 0.5) + 0.1), 2)
 
-    # Normalize Pitchers by Slate
     for slate in slates:
         slate_pitchers = [p for p in pitchers if p["slate"] == slate]
         total_sp_score = sum(p["raw_own_score"] for p in slate_pitchers) or 1.0
         
         for p in slate_pitchers:
-            # Scale to 200% pool, bounded between 1.0% and 65.0%
             proj_own = (p["raw_own_score"] / total_sp_score) * 200.0
             p["proj_own"] = round(max(1.0, min(65.0, proj_own)), 1)
             pts_per_k = p["ceiling"] / (p["salary"] / 1000)
             p["leverage"] = round(pts_per_k / ((p["proj_own"] ** 0.5) + 0.1), 2)
+            
+            # Pitcher GPP Score using all data
+            p["gpp_score"] = round(
+                (p["ceiling"] * 1.1) + (p["proj"] * 0.7) + (p["leverage"] * 2.2) - (p["proj_own"] * 0.35), 2
+            )
 
 def apply_dynamic_percentile_colors(items: list, score_key: str):
-    """Assigns cell colors based on relative rank across the entire slate."""
     if not items:
         return
     items.sort(key=lambda x: x[score_key], reverse=True)
@@ -267,44 +261,49 @@ def apply_dynamic_percentile_colors(items: list, score_key: str):
         item["color"] = TIER_COLORS[tier]
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 6. Projection Engine & 5-Man Stacks
+# 6. Team Stackability & Projection Engine
 # ═════════════════════════════════════════════════════════════════════════════
 
-def generate_5man_stacks(hitters_list: list, team: str, opp: str, implied_runs: float, hr_factor: float, slate_tag: str) -> list:
-    combos = [(1, 2, 3, 4, 5), (1, 2, 3, 4, 9), (2, 3, 4, 5, 6), (1, 3, 4, 5, 6)]
-    hitter_map = {h["order_num"]: h for h in hitters_list}
-    stacks = []
+def calculate_team_stackability(team: str, opp: str, opp_sp: str, implied_runs: float, wx: dict, team_hitters: list, slate_tag: str) -> dict:
+    """Calculates overall team GPP stackability score using all data points."""
+    top5_hitters = sorted(team_hitters, key=lambda x: x["ceiling"], reverse=True)[:5]
+    top5_ceiling_sum = round(sum(h["ceiling"] for h in top5_hitters), 2)
+    top5_proj_sum = round(sum(h["proj"] for h in top5_hitters), 2)
+    total_salary = sum(h["salary"] for h in top5_hitters)
+    avg_own = round(sum(h["proj_own"] for h in top5_hitters) / 5.0, 1)
     
-    for combo in combos:
-        if all(o in hitter_map for o in combo):
-            selected = [hitter_map[o] for o in combo]
-            total_salary = sum(h["salary"] for h in selected)
-            total_proj = sum(h["proj"] for h in selected)
-            total_ceiling = sum(h["ceiling"] for h in selected)
-            stack_own = sum(h["proj_own"] for h in selected)
-            
-            # Rating factors in high projection + low combined ownership boost
-            rating = round((total_proj * 0.4) + (total_ceiling * 0.3) + (implied_runs * 1.5) + (hr_factor * 4) - (stack_own * 0.25), 2)
-            combo_str = "-".join(str(o) for o in combo)
-            names_str = ", ".join([h["name"].split()[-1] for h in selected])
-            
-            stacks.append({
-                "row": [
-                    slate_tag, team, opp, f"Combo ({combo_str})", names_str, 
-                    total_salary, round(total_proj, 2), round(total_ceiling, 2), f"{round(stack_own, 1)}%", rating, implied_runs
-                ],
-                "rating": rating
-            })
-            
-    return stacks
+    # Holistic GPP Team Stackability Score formula
+    raw_stack_score = (
+        (implied_runs * 4.2) + 
+        (wx["hr_factor"] * 12.0) + 
+        (top5_ceiling_sum * 0.22) - 
+        (avg_own * 0.45)
+    )
+    stack_score = round(raw_stack_score, 2)
+    
+    return {
+        "slate": slate_tag,
+        "team": team,
+        "opp": opp,
+        "opp_sp": opp_sp,
+        "implied_runs": implied_runs,
+        "hr_factor": f"{wx['hr_factor']}x",
+        "total_salary": total_salary,
+        "top5_proj": top5_proj_sum,
+        "top5_ceiling": top5_ceiling_sum,
+        "avg_own": f"{avg_own}%",
+        "stackability_score": stack_score,
+        "row": [
+            slate_tag, team, opp, opp_sp, implied_runs, f"{wx['hr_factor']}x",
+            total_salary, top5_proj_sum, top5_ceiling_sum, f"{avg_own}%", stack_score
+        ]
+    }
 
 def build_mlb_projections():
     games = fetch_mlb_slate_data()
     vegas = fetch_vegas_totals()
     
-    hitters, pitchers, all_stacks, weather_rows = [], [], [], []
-    
-    # Slot weights for hitter ownership (Top 4 spots get heavy ownership)
+    hitters, pitchers, team_stacks, weather_rows = [], [], [], []
     slot_weights = {1: 1.4, 2: 1.35, 3: 1.3, 4: 1.25, 5: 1.0, 6: 0.85, 7: 0.75, 8: 0.65, 9: 0.55}
 
     for g in games:
@@ -339,7 +338,6 @@ def build_mlb_projections():
                 ceiling = round(base_proj * 1.85, 2)
                 salary = int(2200 + (base_proj * 380))
                 
-                # Raw ownership score algorithm
                 pts_per_k = base_proj / (salary / 1000)
                 raw_own_score = ((implied_runs / 4.5) ** 1.6) * slot_weights.get(order, 0.8) * (pts_per_k ** 1.2) * wx['hr_factor']
 
@@ -356,20 +354,19 @@ def build_mlb_projections():
                 sp_proj = round(12.5 + (5.0 - implied_runs) * 2.3, 2)
                 sp_ceiling = round(sp_proj * 1.55, 2)
                 sp_salary = int(5200 + (sp_proj * 320))
-                sp_val = sp_proj / (sp_salary / 1000)
                 sp_raw_own = (sp_proj ** 1.8) / ((implied_runs ** 1.1) * (sp_salary / 1000))
                 
                 pitchers.append({
                     "slate": slate_tag, "name": opp_sp, "pos": "P", "team": opp, "opp": team,
                     "salary": sp_salary, "proj": sp_proj, "ceiling": sp_ceiling,
                     "matchup_risk": f"{implied_runs} Implied Runs", "raw_own_score": sp_raw_own,
-                    "proj_own": 0.0, "leverage": 0.0, "score": sp_proj
+                    "proj_own": 0.0, "leverage": 0.0, "gpp_score": 0.0
                 })
 
-    # Step 1: Normalize Slate Ownership & Calculate Leverage
+    # Step 1: Normalize Slate Ownership & Calculate Leverage + Pitcher GPP Score
     normalize_slate_ownership(hitters, pitchers)
     
-    # Step 2: Format Hitter Rows for Sheet Output
+    # Step 2: Format Hitter and Pitcher Rows for Output
     for h in hitters:
         h["row"] = [
             h["slate"], h["name"], h["pos"], h["team"], h["opp"], f"Order {h['order_num']}", 
@@ -379,28 +376,28 @@ def build_mlb_projections():
     for p in pitchers:
         p["row"] = [
             p["slate"], p["name"], "P", p["team"], p["opp"], p["salary"], 
-            p["proj"], p["ceiling"], f"{p['proj_own']}%", p["leverage"]
+            p["proj"], p["ceiling"], f"{p['proj_own']}%", p["leverage"], p["gpp_score"]
         ]
 
-    # Step 3: Generate 5-Man Stacks (Now with finalized hitter ownership)
+    # Step 3: Calculate Team Stackability Scores (No combo patterns)
     for g in games:
         wx = fetch_game_weather(g["venue"])
         slate_tag = g["slate"]
         
         sides = [
-            (g['home'], g['away'], [h for h in hitters if h['team'] == g['home']]),
-            (g['away'], g['home'], [h for h in hitters if h['team'] == g['away']])
+            (g['home'], g['away'], g['away_sp'], [h for h in hitters if h['team'] == g['home']]),
+            (g['away'], g['home'], g['home_sp'], [h for h in hitters if h['team'] == g['away']])
         ]
-        for team, opp, t_hitters in sides:
+        for team, opp, opp_sp, t_hitters in sides:
             implied_runs = vegas.get(team, 4.5)
-            all_stacks.extend(generate_5man_stacks(t_hitters, team, opp, implied_runs, wx['hr_factor'], slate_tag))
+            team_stacks.append(calculate_team_stackability(team, opp, opp_sp, implied_runs, wx, t_hitters, slate_tag))
 
     # Step 4: Apply Dynamic Percentile Color Tiers
     apply_dynamic_percentile_colors(hitters, "leverage")
-    apply_dynamic_percentile_colors(pitchers, "leverage")
-    apply_dynamic_percentile_colors(all_stacks, "rating")
+    apply_dynamic_percentile_colors(pitchers, "gpp_score")
+    apply_dynamic_percentile_colors(team_stacks, "stackability_score")
 
-    return hitters, pitchers, all_stacks, weather_rows
+    return hitters, pitchers, team_stacks, weather_rows
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 7. Google Sheets Exporter
@@ -429,20 +426,52 @@ def post_to_sheets(tab: str, headers: list, items: list) -> bool:
 
 if __name__ == "__main__":
     log.info("Starting MLB DFS Projection Pipeline...")
-    hitters, pitchers, stacks, weather = build_mlb_projections()
+    hitters, pitchers, team_stacks, weather = build_mlb_projections()
     
     # 1. Export Color Key Legend Tab
     legend_headers = ["Tier", "Percentile Range", "Color Code", "Description / GPP Strategy"]
     legend_rows = [
-        {"row": ["Elite", "Top 15%", "Gold (#FFD966)", "High-leverage core plays & top 5-man stack combinations"], "color": TIER_COLORS["Elite"]},
+        {"row": ["Elite", "Top 15%", "Gold (#FFD966)", "High-leverage core plays & top GPP team stacks"], "color": TIER_COLORS["Elite"]},
         {"row": ["Strong", "Next 20% (15%-35%)", "Green (#93C47D)", "Strong leverage and high-upside value targets"], "color": TIER_COLORS["Strong"]},
         {"row": ["Solid", "Next 30% (35%-65%)", "Blue (#9FC5E8)", "Safe baseline cash game plays and secondary correlation fillers"], "color": TIER_COLORS["Solid"]},
         {"row": ["Average", "Next 20% (65%-85%)", "White (#FFFFFF)", "Neutral slate plays and multi-positional salary balancing options"], "color": TIER_COLORS["Average"]},
         {"row": ["Fade", "Bottom 15% (85%-100%)", "Red (#EA9999)", "Low leverage, severe matchup risk, or harsh weather environments"], "color": TIER_COLORS["Fade"]},
     ]
     post_to_sheets("Color Key", legend_headers, legend_rows)
+
+    # 2. Build & Export Dedicated GPP Dashboard Tab (Top 10 Team Stacks & Top 7 Pitchers)
+    top_10_stacks = sorted(team_stacks, key=lambda x: x["stackability_score"], reverse=True)[:10]
+    top_7_pitchers = sorted(pitchers, key=lambda x: x["gpp_score"], reverse=True)[:7]
     
-    # 2. Build & Export Dedicated Ownership Tab
+    dashboard_headers = ["Category / Rank", "Slate", "Name / Team", "Opponent / SP", "Salary / Total", "DK Proj", "DK Ceiling", "Proj Own / Avg", "GPP Score"]
+    dashboard_rows = []
+    
+    # Section Header: Top 10 Team Stacks
+    dashboard_rows.append({"row": ["--- TOP 10 GPP TEAM STACKS ---", "", "", "", "", "", "", "", ""], "color": "#1F4E79"})
+    for idx, s in enumerate(top_10_stacks, 1):
+        dashboard_rows.append({
+            "row": [f"Team Stack #{idx}", s["slate"], s["team"], f"vs {s['opp']} ({s['opp_sp']})", s["total_salary"], s["top5_proj"], s["top5_ceiling"], s["avg_own"], s["stackability_score"]],
+            "color": s["color"]
+        })
+        
+    # Spacer Row
+    dashboard_rows.append({"row": ["", "", "", "", "", "", "", "", ""], "color": "#FFFFFF"})
+    
+    # Section Header: Top 7 GPP Pitchers
+    dashboard_rows.append({"row": ["--- TOP 7 GPP PITCHERS ---", "", "", "", "", "", "", "", ""], "color": "#1F4E79"})
+    for idx, p in enumerate(top_7_pitchers, 1):
+        dashboard_rows.append({
+            "row": [f"Pitcher #{idx}", p["slate"], p["name"], f"vs {p['opp']}", p["salary"], p["proj"], p["ceiling"], f"{p['proj_own']}%", p["gpp_score"]],
+            "color": p["color"]
+        })
+
+    post_to_sheets("GPP Dashboard", dashboard_headers, dashboard_rows)
+
+    # 3. Export Team Stacks Tab (All Teams Ranked by Stackability Score, No Combo Patterns)
+    stack_headers = ["Slate", "Team", "Opponent", "Opp Pitcher", "Implied Runs", "HR Factor", "Top 5 Salary", "Top 5 Proj", "Top 5 Ceiling", "Avg Team Own %", "Team Stack Score"]
+    post_to_sheets("Stacks", stack_headers, team_stacks)
+
+    # 4. Export Dedicated Ownership Tab
     all_players = hitters + pitchers
     all_players.sort(key=lambda x: x["proj_own"], reverse=True)
     ownership_headers = ["Slate", "Player", "DK Pos", "Team", "Opponent", "DK Salary", "DK Proj", "DK Ceiling", "Proj Own %", "GPP Leverage"]
@@ -455,16 +484,13 @@ if __name__ == "__main__":
     ]
     post_to_sheets("Ownership", ownership_headers, ownership_rows)
 
-    # 3. Export Hitters
+    # 5. Export Hitters Tab
     post_to_sheets("Hitters", ["Slate", "Name", "DK Pos", "Team", "Opp", "Order", "Opp SP", "DK Salary", "DK Proj", "DK Ceiling", "Proj Own %", "Leverage"], hitters)
     
-    # 4. Export Pitchers
-    post_to_sheets("Pitchers", ["Slate", "Pitcher", "DK Pos", "Team", "Opp", "DK Salary", "DK Proj", "DK Ceiling", "Proj Own %", "Leverage"], pitchers)
+    # 6. Export Pitchers Tab
+    post_to_sheets("Pitchers", ["Slate", "Pitcher", "DK Pos", "Team", "Opp", "DK Salary", "DK Proj", "DK Ceiling", "Proj Own %", "Leverage", "Pitcher GPP Score"], pitchers)
     
-    # 5. Export 5-Man Stacks
-    post_to_sheets("Stacks", ["Slate", "Team", "Opponent", "Stack Pattern", "Hitters Included", "Total DK Salary", "Combined Proj", "Combined Ceiling", "Stack Own %", "Stack Rating", "Implied Runs"], stacks)
-    
-    # 6. Export Weather
+    # 7. Export Weather Tab
     post_to_sheets("Weather", ["Slate", "Matchup", "Venue", "Temp (°F)", "Wind (mph)", "HR Factor"], [{"row": r, "color": "#FFFFFF"} for r in weather])
     
     log.info("MLB DFS Pipeline Execution Complete.")
