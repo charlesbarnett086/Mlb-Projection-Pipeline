@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-MLB DFS Projection Pipeline (DraftKings 5-Man Stacks & Slate-Separated)
+MLB DFS Projection Pipeline (DraftKings 5-Man Stacks & Ownership Model)
 ────────────────────────────────────────────────────────────────────────
 Features:
-  - Real Player Names: Official game lineups & active team rosters
-  - Timezone & Slate Classification: Python zoneinfo (America/New_York)
-  - Dynamic Relative Percentile Colors & Color Key tab export
-  - DraftKings Positions: P, C, 1B, 2B, 3B, SS, OF
-  - Free API Stack: MLB Stats API, Open-Meteo Weather, The Odds API
+  - Algorithmic Ownership Projections: Normalized slate-wide ownership
+    for hitters (800% total slate pool) and pitchers (200% total slate pool).
+  - Ownership & GPP Leverage: Incorporates projected ownership into 
+    hitter, pitcher, and 5-man stack GPP leverage ratings.
+  - Dedicated Ownership Tab: Ranks top chalk vs. leverage plays across slates.
+  - Real Player Names: Official game lineups & active team rosters.
+  - Accurate Slate Classification: Python zoneinfo (America/New_York).
 """
 
 import os
@@ -137,11 +139,10 @@ def fetch_vegas_totals() -> dict:
         return {}
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 4. MLB Schedule & Active Roster / Lineup Parser
+# 4. MLB Schedule & Active Roster Parser
 # ═════════════════════════════════════════════════════════════════════════════
 
 def fetch_team_active_hitters(team_id: int) -> list:
-    """Fetches real hitter names from active team roster if lineups unposted."""
     if team_id in ROSTER_CACHE:
         return ROSTER_CACHE[team_id]
         
@@ -209,8 +210,40 @@ def fetch_mlb_slate_data():
         return []
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 5. Percentile-Based Color Assignment Engine
+# 5. Ownership & Percentile Engine
 # ═════════════════════════════════════════════════════════════════════════════
+
+def normalize_slate_ownership(hitters: list, pitchers: list):
+    """
+    Normalizes ownership percentages per slate.
+    DK Hitter Total Pool = 800% per slate (8 hitter slots).
+    DK Pitcher Total Pool = 200% per slate (2 SP slots).
+    """
+    # Normalize Hitters by Slate
+    slates = set(h["slate"] for h in hitters)
+    for slate in slates:
+        slate_hitters = [h for h in hitters if h["slate"] == slate]
+        total_hitter_score = sum(h["raw_own_score"] for h in slate_hitters) or 1.0
+        
+        for h in slate_hitters:
+            # Scale to 800% pool, bounded between 0.5% and 35.0%
+            proj_own = (h["raw_own_score"] / total_hitter_score) * 800.0
+            h["proj_own"] = round(max(0.5, min(35.0, proj_own)), 1)
+            # Leverage Score incorporating Ownership: (Ceiling / Salary Ratio) / sqrt(Ownership)
+            pts_per_k = h["ceiling"] / (h["salary"] / 1000)
+            h["leverage"] = round(pts_per_k / ((h["proj_own"] ** 0.5) + 0.1), 2)
+
+    # Normalize Pitchers by Slate
+    for slate in slates:
+        slate_pitchers = [p for p in pitchers if p["slate"] == slate]
+        total_sp_score = sum(p["raw_own_score"] for p in slate_pitchers) or 1.0
+        
+        for p in slate_pitchers:
+            # Scale to 200% pool, bounded between 1.0% and 65.0%
+            proj_own = (p["raw_own_score"] / total_sp_score) * 200.0
+            p["proj_own"] = round(max(1.0, min(65.0, proj_own)), 1)
+            pts_per_k = p["ceiling"] / (p["salary"] / 1000)
+            p["leverage"] = round(pts_per_k / ((p["proj_own"] ** 0.5) + 0.1), 2)
 
 def apply_dynamic_percentile_colors(items: list, score_key: str):
     """Assigns cell colors based on relative rank across the entire slate."""
@@ -248,15 +281,17 @@ def generate_5man_stacks(hitters_list: list, team: str, opp: str, implied_runs: 
             total_salary = sum(h["salary"] for h in selected)
             total_proj = sum(h["proj"] for h in selected)
             total_ceiling = sum(h["ceiling"] for h in selected)
+            stack_own = sum(h["proj_own"] for h in selected)
             
-            rating = round((total_proj * 0.4) + (total_ceiling * 0.3) + (implied_runs * 1.5) + (hr_factor * 4), 2)
+            # Rating factors in high projection + low combined ownership boost
+            rating = round((total_proj * 0.4) + (total_ceiling * 0.3) + (implied_runs * 1.5) + (hr_factor * 4) - (stack_own * 0.25), 2)
             combo_str = "-".join(str(o) for o in combo)
             names_str = ", ".join([h["name"].split()[-1] for h in selected])
             
             stacks.append({
                 "row": [
                     slate_tag, team, opp, f"Combo ({combo_str})", names_str, 
-                    total_salary, round(total_proj, 2), round(total_ceiling, 2), rating, implied_runs
+                    total_salary, round(total_proj, 2), round(total_ceiling, 2), f"{round(stack_own, 1)}%", rating, implied_runs
                 ],
                 "rating": rating
             })
@@ -269,6 +304,9 @@ def build_mlb_projections():
     
     hitters, pitchers, all_stacks, weather_rows = [], [], [], []
     
+    # Slot weights for hitter ownership (Top 4 spots get heavy ownership)
+    slot_weights = {1: 1.4, 2: 1.35, 3: 1.3, 4: 1.25, 5: 1.0, 6: 0.85, 7: 0.75, 8: 0.65, 9: 0.55}
+
     for g in games:
         wx = fetch_game_weather(g["venue"])
         slate_tag = g["slate"]
@@ -300,31 +338,66 @@ def build_mlb_projections():
                 base_proj = round((8.8 * slot_mult) * (implied_runs / 4.5) * wx['hr_factor'], 2)
                 ceiling = round(base_proj * 1.85, 2)
                 salary = int(2200 + (base_proj * 380))
-                leverage = round(ceiling / (salary / 1000), 2)
                 
+                # Raw ownership score algorithm
+                pts_per_k = base_proj / (salary / 1000)
+                raw_own_score = ((implied_runs / 4.5) ** 1.6) * slot_weights.get(order, 0.8) * (pts_per_k ** 1.2) * wx['hr_factor']
+
                 hitter_item = {
-                    "name": name, "order_num": order, "salary": salary, 
-                    "proj": base_proj, "ceiling": ceiling, "leverage": leverage,
-                    "row": [slate_tag, name, pos, team, opp, f"Order {order}", opp_sp, salary, base_proj, ceiling, leverage]
+                    "slate": slate_tag, "name": name, "pos": pos, "team": team, "opp": opp,
+                    "order_num": order, "opp_sp": opp_sp, "salary": salary, "proj": base_proj,
+                    "ceiling": ceiling, "raw_own_score": raw_own_score, "proj_own": 0.0, "leverage": 0.0
                 }
                 
                 team_hitters.append(hitter_item)
                 hitters.append(hitter_item)
             
-            all_stacks.extend(generate_5man_stacks(team_hitters, team, opp, implied_runs, wx['hr_factor'], slate_tag))
-            
             if opp_sp and opp_sp != "TBD Pitcher":
                 sp_proj = round(12.5 + (5.0 - implied_runs) * 2.3, 2)
                 sp_ceiling = round(sp_proj * 1.55, 2)
                 sp_salary = int(5200 + (sp_proj * 320))
+                sp_val = sp_proj / (sp_salary / 1000)
+                sp_raw_own = (sp_proj ** 1.8) / ((implied_runs ** 1.1) * (sp_salary / 1000))
                 
                 pitchers.append({
-                    "score": sp_proj,
-                    "row": [slate_tag, opp_sp, "P", opp, team, sp_salary, sp_proj, sp_ceiling, f"{implied_runs} Implied Runs"]
+                    "slate": slate_tag, "name": opp_sp, "pos": "P", "team": opp, "opp": team,
+                    "salary": sp_salary, "proj": sp_proj, "ceiling": sp_ceiling,
+                    "matchup_risk": f"{implied_runs} Implied Runs", "raw_own_score": sp_raw_own,
+                    "proj_own": 0.0, "leverage": 0.0, "score": sp_proj
                 })
 
+    # Step 1: Normalize Slate Ownership & Calculate Leverage
+    normalize_slate_ownership(hitters, pitchers)
+    
+    # Step 2: Format Hitter Rows for Sheet Output
+    for h in hitters:
+        h["row"] = [
+            h["slate"], h["name"], h["pos"], h["team"], h["opp"], f"Order {h['order_num']}", 
+            h["opp_sp"], h["salary"], h["proj"], h["ceiling"], f"{h['proj_own']}%", h["leverage"]
+        ]
+        
+    for p in pitchers:
+        p["row"] = [
+            p["slate"], p["name"], "P", p["team"], p["opp"], p["salary"], 
+            p["proj"], p["ceiling"], f"{p['proj_own']}%", p["leverage"]
+        ]
+
+    # Step 3: Generate 5-Man Stacks (Now with finalized hitter ownership)
+    for g in games:
+        wx = fetch_game_weather(g["venue"])
+        slate_tag = g["slate"]
+        
+        sides = [
+            (g['home'], g['away'], [h for h in hitters if h['team'] == g['home']]),
+            (g['away'], g['home'], [h for h in hitters if h['team'] == g['away']])
+        ]
+        for team, opp, t_hitters in sides:
+            implied_runs = vegas.get(team, 4.5)
+            all_stacks.extend(generate_5man_stacks(t_hitters, team, opp, implied_runs, wx['hr_factor'], slate_tag))
+
+    # Step 4: Apply Dynamic Percentile Color Tiers
     apply_dynamic_percentile_colors(hitters, "leverage")
-    apply_dynamic_percentile_colors(pitchers, "score")
+    apply_dynamic_percentile_colors(pitchers, "leverage")
     apply_dynamic_percentile_colors(all_stacks, "rating")
 
     return hitters, pitchers, all_stacks, weather_rows
@@ -358,7 +431,7 @@ if __name__ == "__main__":
     log.info("Starting MLB DFS Projection Pipeline...")
     hitters, pitchers, stacks, weather = build_mlb_projections()
     
-    # Export Color Key Legend Tab
+    # 1. Export Color Key Legend Tab
     legend_headers = ["Tier", "Percentile Range", "Color Code", "Description / GPP Strategy"]
     legend_rows = [
         {"row": ["Elite", "Top 15%", "Gold (#FFD966)", "High-leverage core plays & top 5-man stack combinations"], "color": TIER_COLORS["Elite"]},
@@ -369,16 +442,29 @@ if __name__ == "__main__":
     ]
     post_to_sheets("Color Key", legend_headers, legend_rows)
     
-    # Export Hitters
-    post_to_sheets("Hitters", ["Slate", "Name", "DK Pos", "Team", "Opp", "Order", "Opp SP", "DK Salary", "DK Proj", "DK Ceiling", "Leverage"], hitters)
+    # 2. Build & Export Dedicated Ownership Tab
+    all_players = hitters + pitchers
+    all_players.sort(key=lambda x: x["proj_own"], reverse=True)
+    ownership_headers = ["Slate", "Player", "DK Pos", "Team", "Opponent", "DK Salary", "DK Proj", "DK Ceiling", "Proj Own %", "GPP Leverage"]
+    ownership_rows = [
+        {
+            "row": [p["slate"], p["name"], p["pos"], p["team"], p["opp"], p["salary"], p["proj"], p["ceiling"], f"{p['proj_own']}%", p["leverage"]],
+            "color": p["color"]
+        }
+        for p in all_players
+    ]
+    post_to_sheets("Ownership", ownership_headers, ownership_rows)
+
+    # 3. Export Hitters
+    post_to_sheets("Hitters", ["Slate", "Name", "DK Pos", "Team", "Opp", "Order", "Opp SP", "DK Salary", "DK Proj", "DK Ceiling", "Proj Own %", "Leverage"], hitters)
     
-    # Export Pitchers
-    post_to_sheets("Pitchers", ["Slate", "Pitcher", "DK Pos", "Team", "Opp", "DK Salary", "DK Proj", "DK Ceiling", "Matchup Risk"], pitchers)
+    # 4. Export Pitchers
+    post_to_sheets("Pitchers", ["Slate", "Pitcher", "DK Pos", "Team", "Opp", "DK Salary", "DK Proj", "DK Ceiling", "Proj Own %", "Leverage"], pitchers)
     
-    # Export 5-Man Stacks
-    post_to_sheets("Stacks", ["Slate", "Team", "Opponent", "Stack Pattern", "Hitters Included", "Total DK Salary", "Combined Proj", "Combined Ceiling", "Stack Rating", "Implied Runs"], stacks)
+    # 5. Export 5-Man Stacks
+    post_to_sheets("Stacks", ["Slate", "Team", "Opponent", "Stack Pattern", "Hitters Included", "Total DK Salary", "Combined Proj", "Combined Ceiling", "Stack Own %", "Stack Rating", "Implied Runs"], stacks)
     
-    # Export Weather
+    # 6. Export Weather
     post_to_sheets("Weather", ["Slate", "Matchup", "Venue", "Temp (°F)", "Wind (mph)", "HR Factor"], [{"row": r, "color": "#FFFFFF"} for r in weather])
     
     log.info("MLB DFS Pipeline Execution Complete.")
