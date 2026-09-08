@@ -1,22 +1,21 @@
-#!/usr/bin/env python3
+  #!/usr/bin/env python3
 """
-MLB DFS Projection Pipeline (DraftKings & 5-Man Stack Optimized)
-─────────────────────────────────────────────────────────────────
+MLB DFS Projection Pipeline (DraftKings 5-Man Stacks & Slate-Separated)
+────────────────────────────────────────────────────────────────────────
 Features:
+  - Slate Categorization: Groups games by Early, Afternoon, or Main + Start Time ET
   - DraftKings Positions: P, C, 1B, 2B, 3B, SS, OF
-  - 5-Man Stack Combinations: Generates optimal 5-batter team stacks (1-5, 1-4+9, 2-6)
-  - Data Sources: MLB Stats API, Open-Meteo, The Odds API
-  - Outputs: Hitters, Pitchers, Stacks (5-Man), Weather
+  - 5-Man Stack Engine: Evaluates optimal 5-batter correlation combinations
+  - Free API Stack: MLB Stats API, Open-Meteo Weather, The Odds API
 """
 
 import os
 import sys
 import logging
 from datetime import datetime
-from itertools import combinations
 import requests
 
-# ── Logging ────
+# ── Logging Setup ────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -24,7 +23,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Endpoints & Secrets ────
+# ── API Endpoints & Config ────
 MLB_API_BASE     = "https://statsapi.mlb.com/api/v1"
 OPEN_METEO_URL   = "https://api.open-meteo.com/v1/forecast"
 ODDS_API_URL     = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds/"
@@ -59,7 +58,30 @@ TIER_COLORS = {
 HEADER_COLOR = "#1F4E79"
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 1. Weather Engine (Open-Meteo)
+# 1. Slate & Time Classification
+# ═════════════════════════════════════════════════════════════════════════════
+
+def get_slate_info(game_date_utc: str) -> str:
+    """Converts MLB API UTC game time to ET start time and Slate category."""
+    if not game_date_utc:
+        return "Main Slate"
+    try:
+        dt_utc = datetime.fromisoformat(game_date_utc.replace("Z", "+00:00"))
+        # Approximate Eastern Time conversion (UTC-4)
+        et_hour = (dt_utc.hour - 4) % 24
+        time_str = dt_utc.strftime("%I:%M %p ET").lstrip("0")
+        
+        if et_hour < 16:
+            return f"Early ({time_str})"
+        elif et_hour < 18:
+            return f"Afternoon ({time_str})"
+        else:
+            return f"Main ({time_str})"
+    except Exception:
+        return "Main Slate"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 2. Weather Engine (Open-Meteo)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def fetch_game_weather(venue_name: str) -> dict:
@@ -86,7 +108,7 @@ def fetch_game_weather(venue_name: str) -> dict:
         return {"temp": 70.0, "wind": 5.0, "hr_factor": 1.0}
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 2. Vegas Lines & Totals
+# 3. Vegas Lines & Totals
 # ═════════════════════════════════════════════════════════════════════════════
 
 def fetch_vegas_totals() -> dict:
@@ -113,7 +135,7 @@ def fetch_vegas_totals() -> dict:
         return {}
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 3. MLB Slate Data
+# 4. MLB Slate Data
 # ═════════════════════════════════════════════════════════════════════════════
 
 def fetch_mlb_slate_data():
@@ -129,7 +151,11 @@ def fetch_mlb_slate_data():
             return []
             
         for game in dates[0].get("games", []):
+            game_utc = game.get("gameDate", "")
+            slate_tag = get_slate_info(game_utc)
+            
             games.append({
+                "slate": slate_tag,
                 "home": game["teams"]["home"]["team"]["name"],
                 "away": game["teams"]["away"]["team"]["name"],
                 "home_sp": game["teams"]["home"].get("probablePitcher", {}).get("fullName", "TBD"),
@@ -142,12 +168,11 @@ def fetch_mlb_slate_data():
         return []
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 4. 5-Man Stack Generator & Projection Engine
+# 5. 5-Man Stack Generator & Projection Engine
 # ═════════════════════════════════════════════════════════════════════════════
 
-def generate_5man_stacks(hitters_list: list, team: str, opp: str, implied_runs: float, hr_factor: float) -> list:
+def generate_5man_stacks(hitters_list: list, team: str, opp: str, implied_runs: float, hr_factor: float, slate_tag: str) -> list:
     """Calculates top 5-man DraftKings stacking combinations for a team."""
-    # Top correlation patterns: 1-2-3-4-5, 1-2-3-4-9 (wrap-around), 2-3-4-5-6
     combos = [
         (1, 2, 3, 4, 5),
         (1, 2, 3, 4, 9),
@@ -165,7 +190,6 @@ def generate_5man_stacks(hitters_list: list, team: str, opp: str, implied_runs: 
             total_proj = sum(h["proj"] for h in selected)
             total_ceiling = sum(h["ceiling"] for h in selected)
             
-            # Stack Rating factoring DK scoring correlation
             rating = round((total_proj * 0.4) + (total_ceiling * 0.3) + (implied_runs * 1.5) + (hr_factor * 4), 2)
             combo_str = "-".join(str(o) for o in combo)
             names_str = ", ".join([h["name"].split()[-1] for h in selected])
@@ -174,7 +198,7 @@ def generate_5man_stacks(hitters_list: list, team: str, opp: str, implied_runs: 
             
             stacks.append({
                 "row": [
-                    team, opp, f"Combo ({combo_str})", names_str, 
+                    slate_tag, team, opp, f"Combo ({combo_str})", names_str, 
                     total_salary, round(total_proj, 2), round(total_ceiling, 2), rating, implied_runs
                 ],
                 "color": TIER_COLORS[tier],
@@ -191,9 +215,10 @@ def build_mlb_projections():
     
     for g in games:
         wx = fetch_game_weather(g["venue"])
+        slate_tag = g["slate"]
         
         weather_rows.append([
-            f"{g['away']} @ {g['home']}", g['venue'], 
+            slate_tag, f"{g['away']} @ {g['home']}", g['venue'], 
             wx['temp'], wx['wind'], f"{wx['hr_factor']}x HR Factor"
         ])
         
@@ -205,11 +230,9 @@ def build_mlb_projections():
                 name = f"{team} Hitter {order}"
                 pos = DK_POSITION_MAP[order]
                 
-                # DK scoring baseline projection
                 base_proj = (9.5 - (order * 0.55)) * (implied_runs / 4.5) * wx['hr_factor']
                 ceiling = round(base_proj * 1.9, 2)
                 
-                # DraftKings Salary logic ($2,000 to $6,300)
                 salary = max(2000, min(6300, int(base_proj * 480)))
                 leverage = round((ceiling / (salary / 1000)), 2)
                 
@@ -222,15 +245,15 @@ def build_mlb_projections():
                 team_hitters.append(hitter_data)
                 
                 hitters.append({
-                    "row": [name, pos, team, opp, f"Order {order}", opp_sp, salary, round(base_proj, 2), ceiling, leverage],
+                    "row": [slate_tag, name, pos, team, opp, f"Order {order}", opp_sp, salary, round(base_proj, 2), ceiling, leverage],
                     "color": TIER_COLORS[tier]
                 })
             
             # Generate 5-Man Stacks
-            team_stacks = generate_5man_stacks(team_hitters, team, opp, implied_runs, wx['hr_factor'])
+            team_stacks = generate_5man_stacks(team_hitters, team, opp, implied_runs, wx['hr_factor'], slate_tag)
             all_stacks.extend(team_stacks)
             
-            # DraftKings Pitcher Projection (2 SP slots)
+            # Pitcher Projection
             sp_name = opp_sp
             if sp_name != "TBD":
                 sp_proj = round(13.5 + (5.0 - implied_runs) * 2.2, 2)
@@ -239,14 +262,14 @@ def build_mlb_projections():
                 sp_tier = "Elite" if sp_proj > 19.0 else ("Strong" if sp_proj > 14.0 else "Solid")
                 
                 pitchers.append({
-                    "row": [sp_name, "P", opp, team, sp_salary, sp_proj, sp_ceiling, f"{implied_runs} Implied Runs"],
+                    "row": [slate_tag, sp_name, "P", opp, team, sp_salary, sp_proj, sp_ceiling, f"{implied_runs} Implied Runs"],
                     "color": TIER_COLORS[sp_tier]
                 })
 
     return hitters, pitchers, all_stacks, weather_rows
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 5. Google Sheets Exporter
+# 6. Google Sheets Exporter
 # ═════════════════════════════════════════════════════════════════════════════
 
 def post_to_sheets(tab: str, headers: list, items: list) -> bool:
@@ -271,19 +294,19 @@ def post_to_sheets(tab: str, headers: list, items: list) -> bool:
 # ═════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    log.info("Starting DraftKings MLB DFS Pipeline...")
+    log.info("Starting MLB DFS Projection Pipeline...")
     hitters, pitchers, stacks, weather = build_mlb_projections()
     
     # Export Hitters
-    post_to_sheets("Hitters", ["Name", "DK Pos", "Team", "Opp", "Order", "Opp SP", "DK Salary", "DK Proj", "DK Ceiling", "Leverage"], hitters)
+    post_to_sheets("Hitters", ["Slate", "Name", "DK Pos", "Team", "Opp", "Order", "Opp SP", "DK Salary", "DK Proj", "DK Ceiling", "Leverage"], hitters)
     
     # Export Pitchers
-    post_to_sheets("Pitchers", ["Pitcher", "DK Pos", "Team", "Opp", "DK Salary", "DK Proj", "DK Ceiling", "Matchup Risk"], pitchers)
+    post_to_sheets("Pitchers", ["Slate", "Pitcher", "DK Pos", "Team", "Opp", "DK Salary", "DK Proj", "DK Ceiling", "Matchup Risk"], pitchers)
     
     # Export 5-Man Stacks
-    post_to_sheets("Stacks", ["Team", "Opponent", "Stack Pattern", "Hitters Included", "Total DK Salary", "Combined Proj", "Combined Ceiling", "Stack Rating", "Implied Runs"], stacks)
+    post_to_sheets("Stacks", ["Slate", "Team", "Opponent", "Stack Pattern", "Hitters Included", "Total DK Salary", "Combined Proj", "Combined Ceiling", "Stack Rating", "Implied Runs"], stacks)
     
     # Export Weather
-    post_to_sheets("Weather", ["Matchup", "Venue", "Temp (°F)", "Wind (mph)", "HR Factor"], [{"row": r, "color": "#FFFFFF"} for r in weather])
+    post_to_sheets("Weather", ["Slate", "Matchup", "Venue", "Temp (°F)", "Wind (mph)", "HR Factor"], [{"row": r, "color": "#FFFFFF"} for r in weather])
     
-    log.info("DraftKings MLB Pipeline Execution Complete.")
+    log.info("MLB DFS Pipeline Execution Complete.")
